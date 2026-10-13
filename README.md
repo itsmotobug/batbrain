@@ -1,4 +1,4 @@
-# Moto Bug Bot (Batbrain)
+# Bat Brain
 
 <p align="center">
   <img src="./Cute%20Blue%20Mechanical%20Bat%20Drone.png" alt="Cute blue mechanical bat drone" width="240">
