@@ -1,0 +1,9 @@
+# Secrets
+keys.local.bat
+pump portal.txt
+.env
+
+# Personal settings
+strategy.json
+
+node_modules/
