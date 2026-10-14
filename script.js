@@ -6,10 +6,16 @@ const strat = require("./strategy");
 const API_KEY = process.env.PUMPPORTAL_API_KEY;
 const LIVE = process.env.LIVE_TRADING === "1";
 const HOST = "pumpportal.fun";
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+const DEFAULT_WALLET = process.env.PUBLIC_WALLET_KEY || process.env.PUMPPORTAL_WALLET_PUBLIC_KEY;
+const DEFAULT_SOL_USD = Number(process.env.SOL_TO_USDC || process.env.SOL_USD_PRICE || 150);
+let solUsdRate = Number.isFinite(DEFAULT_SOL_USD) && DEFAULT_SOL_USD > 0 ? DEFAULT_SOL_USD : 150;
 const MAX_BUY = 0.01;
 const DEFAULT_BUY = Number(process.env.DEFAULT_BUY_SOL || 0.005);
 const MAX_SESSION_SOL = Number(process.env.MAX_SESSION_SOL || 0.05);
 const KEEPALIVE_MS = 20_000;
+const SOL_RATE_REFRESH_MS = 30_000;
+const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 // One persistent TLS connection, reused for every order.
 const agent = new https.Agent({ keepAlive: true, maxSockets: 1, keepAliveMsecs: 30_000 });
@@ -93,6 +99,99 @@ async function warmUp() {
   }
 }
 
+async function solanaRpc(method, params) {
+  const res = await fetch(SOLANA_RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Solana RPC failed: HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  if (data.error) {
+    throw new Error(`Solana RPC error: ${data.error.message || JSON.stringify(data.error)}`);
+  }
+  return data.result;
+}
+
+async function fetchWalletBalances(publicKey) {
+  const key = (publicKey || DEFAULT_WALLET || "").trim();
+  if (!key) {
+    throw new Error("No wallet configured. Set PUBLIC_WALLET_KEY.");
+  }
+
+  const lamports = Number((await solanaRpc("getBalance", [key])).value || 0);
+  const sol = lamports / 1e9;
+
+  let usdc = 0;
+  try {
+    const tokenAccounts = await solanaRpc("getTokenAccountsByOwner", [key, { mint: USDC_MINT }, { encoding: "jsonParsed" }]);
+    for (const entry of tokenAccounts.value || []) {
+      const amount = Number(entry.account?.data?.parsed?.info?.tokenAmount?.uiAmount ?? 0);
+      usdc += amount;
+    }
+  } catch (err) {
+    usdc = 0;
+  }
+
+  return {
+    publicKey: key,
+    sol,
+    usdc,
+    raw: {
+      balance: lamports,
+      usdcMint: USDC_MINT,
+      rpc: SOLANA_RPC_URL,
+    },
+  };
+}
+
+async function refreshSolUsdRate() {
+  const override = Number(process.env.SOL_TO_USDC || process.env.SOL_USD_PRICE);
+  if (Number.isFinite(override) && override > 0) {
+    solUsdRate = override;
+    return solUsdRate;
+  }
+
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const next = Number(data?.solana?.usd);
+    if (Number.isFinite(next) && next > 0) solUsdRate = next;
+  } catch {
+    // Keep the last known rate; if nothing is configured, fall back to the default approximation.
+  }
+  return solUsdRate;
+}
+
+function usdValue(solValue) {
+  return (Number(solValue) || 0) * solUsdRate;
+}
+
+function deriveTokenPriceSol(marketRecord) {
+  const marketCapSol = Number(marketRecord?.marketCapSol);
+  const supply = Number(marketRecord?.totalSupply ?? marketRecord?.supply ?? marketRecord?.circulatingSupply ?? 0);
+  if (!Number.isFinite(marketCapSol) || marketCapSol <= 0) return null;
+  if (!Number.isFinite(supply) || supply <= 0) return null;
+  return marketCapSol / supply;
+}
+
+function compactNumber(value, digits = 2) {
+  const n = Number(value) || 0;
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(digits).replace(/\.?0+$/, "")}M`;
+  }
+  if (abs >= 1_000) {
+    return `${(n / 1_000).toFixed(digits).replace(/\.?0+$/, "")}K`;
+  }
+  return Number.isInteger(n) ? String(n) : n.toFixed(digits).replace(/\.?0+$/, "");
+}
+
 async function sendOrder(payload) {
   const t0 = performance.now();
   const res = await request("POST", `/api/trade?api-key=${encodeURIComponent(API_KEY)}`, payload);
@@ -146,12 +245,14 @@ function printHelp() {
   sell                sell 100% of current mint
   buy/sell <MINT>     same, and also sets the current mint
   mint                show current mint
+  balance             show SOL + USDC balance for the linked wallet
   strategy            show strategy settings; "strategy modes" lists buying modes
   strategy mode <m>   choose buying mode (dip, breakout, momentum, ladder, dca)
   set <key> <value>   change a strategy setting (saved to strategy.json)
   watch               watch the current mint's price and buy per the strategy
   unwatch             stop watching
-  price               show latest price and watch stats
+  mcap                show latest market-cap estimate + token price estimate
+  pnl                 show average cost, position qty, and unrealized PnL
   arm                 enable live orders for this session (asks for TRADE)
   disarm              disable live orders
   status              show mode, armed state, spend, current mint
@@ -163,6 +264,7 @@ const config = strat.loadConfig();
 let engine = null;
 let feed = null;
 let watchTimer = null;
+let solRateTimer = null;
 let busy = false;
 let failures = 0;
 let lastPrintAt = 0;
@@ -200,8 +302,10 @@ function showStrategy() {
 function stopWatch() {
   if (feed) feed.stop();
   clearInterval(watchTimer);
+  clearInterval(solRateTimer);
   feed = null;
   watchTimer = null;
+  solRateTimer = null;
   engine = null;
 }
 
@@ -212,7 +316,7 @@ async function maybeBuy(now) {
 
   busy = true;
   try {
-    console.log(`\n[strategy] BUY signal: ${signal.reason} @ ${engine.lastPrice.toFixed(3)} SOL mcap`);
+    console.log(`\n[strategy] BUY signal: ${signal.reason} @ ${compactNumber(usdValue(engine.lastPrice), 2)} USDC mcap`);
     await execute("buy", currentMint, config.buySol);
     failures = 0;
     engine.markBought(now);
@@ -232,15 +336,17 @@ async function maybeBuy(now) {
   }
 }
 
-function startWatch() {
+async function startWatch() {
   if (feed) throw new Error("Already watching. Type unwatch first.");
   if (!currentMint) throw new Error("No current mint. Paste a mint first.");
   if (!API_KEY) throw new Error("Missing API key (needed for the price feed).");
   if (config.buySol > MAX_BUY) throw new Error(`buySol exceeds the ${MAX_BUY} SOL per-order limit.`);
   if (LIVE && !armed) throw new Error("Not armed. Type: arm");
 
+  await refreshSolUsdRate();
   engine = new strat.Strategy(config);
   failures = 0;
+  solRateTimer = setInterval(() => void refreshSolUsdRate(), SOL_RATE_REFRESH_MS);
   feed = new strat.PriceFeed({
     apiKey: API_KEY,
     mint: currentMint,
@@ -251,13 +357,25 @@ function startWatch() {
         console.error("[feed] Price data needs the API key's wallet funded with at least 0.02 SOL. Watch stopped.");
       }
     },
-    onPrice: (price) => {
+    onPrice: (price, marketRecord) => {
       const now = Date.now();
       if (!engine) return;
-      engine.record(now, price);
+      engine.record(now, price, marketRecord);
       if (now - lastPrintAt > 5000) {
         lastPrintAt = now;
-        console.log(`[price] ${price.toFixed(3)} SOL mcap`);
+        const p = engine.positionSummary;
+        const priceUsdc = usdValue(p.markPrice || 0);
+        const avgUsdc = usdValue(p.avgCostSol || 0);
+        const pnlUsdc = usdValue(p.pnlSol || 0);
+        const tokenPriceSol = deriveTokenPriceSol(marketRecord);
+        const tokenPriceUsdc = tokenPriceSol === null ? null : usdValue(tokenPriceSol);
+        const priceText = tokenPriceUsdc === null ? "price=n/a" : `price=${compactNumber(tokenPriceUsdc, 2)} USDC`;
+        console.log(
+          `[mcap] mcap=${compactNumber(priceUsdc, 2)} USDC ${priceText} ` +
+            `qty=${p.qty.toFixed(4)} ` +
+            `avg=${compactNumber(avgUsdc, 2)} USDC ` +
+            `pnl=${compactNumber(pnlUsdc, 2)} USDC`
+        );
       }
       maybeBuy(now);
     },
@@ -267,7 +385,7 @@ function startWatch() {
   watchTimer = setInterval(() => maybeBuy(Date.now()), 1000);
   console.log(
     `Watching ${currentMint} in ${config.mode} mode (${LIVE ? "LIVE" : "SIMULATION"}). ` +
-      `Max ${config.maxBuys} buys of ${config.buySol} SOL.`
+      `${config.maxBuys > 0 ? `Max ${config.maxBuys} buys` : "Unlimited buys"} of ${config.buySol} SOL each.`
   );
 }
 
@@ -303,6 +421,19 @@ async function handle(line, rl) {
       return rl.close();
     case "mint":
       return console.log(currentMint ? `Current mint: ${currentMint}` : "No current mint set.");
+    case "balance": {
+      try {
+        const wallet = await fetchWalletBalances(a || DEFAULT_WALLET);
+        console.log(`wallet=${wallet.publicKey}`);
+        console.log(`SOL=${compactNumber(wallet.sol, 2)}`);
+        console.log(`USDC=${compactNumber(wallet.usdc, 2)}`);
+        console.log(`rawBalanceLamports=${wallet.raw.balance}`);
+        console.log(`rpc=${wallet.raw.rpc}`);
+        return;
+      } catch (e) {
+        throw new Error(`Balance lookup failed: ${e.message}`);
+      }
+    }
     case "strategy":
       return handleStrategy(a, b);
     case "set": {
@@ -319,9 +450,37 @@ async function handle(line, rl) {
     case "unwatch":
       stopWatch();
       return console.log("Watch stopped.");
-    case "price":
+    case "mcap": {
+      if (!engine) return console.log("No market cap yet. Use watch.");
+      const lastRecord = engine.lastRecord || null;
+      const tokenPriceSol = deriveTokenPriceSol(lastRecord);
+      const tokenPriceUsdc = tokenPriceSol === null ? null : usdValue(tokenPriceSol);
+      const priceText = tokenPriceUsdc === null ? "price=n/a" : `price=${compactNumber(tokenPriceUsdc, 2)} USDC`;
+      return console.log(
+        `mcap=${engine.lastPrice === null ? "n/a" : `${compactNumber(usdValue(engine.lastPrice), 2)} USDC`} ${priceText} buys=${engine.buys}/${config.maxBuys || "unlimited"} ticks=${engine.history.length}`
+      );
+    }
+    case "price": {
+      if (!engine || engine.lastPrice === null) return console.log("No market cap yet. Use watch.");
+      const lastRecord = engine.lastRecord || null;
+      const tokenPriceSol = deriveTokenPriceSol(lastRecord);
+      const tokenPriceUsdc = tokenPriceSol === null ? null : usdValue(tokenPriceSol);
+      const priceText = tokenPriceUsdc === null ? "price=n/a" : `price=${compactNumber(tokenPriceUsdc, 2)} USDC`;
+      return console.log(
+        `mcap=${compactNumber(usdValue(engine.lastPrice), 2)} USDC ${priceText} buys=${engine.buys}/${config.maxBuys || "unlimited"} ticks=${engine.history.length}`
+      );
+    }
+    case "pnl": {
       if (!engine || engine.lastPrice === null) return console.log("No price yet. Use watch.");
-      return console.log(`price=${engine.lastPrice.toFixed(3)} SOL mcap buys=${engine.buys}/${config.maxBuys} ticks=${engine.history.length}`);
+      const p = engine.positionSummary;
+      const priceUsdc = usdValue(p.markPrice || 0);
+      const avgUsdc = usdValue(p.avgCostSol || 0);
+      const pnlUsdc = usdValue(p.pnlSol || 0);
+      return console.log(
+        `qty=${p.qty.toFixed(4)} avg=${compactNumber(avgUsdc, 2)} USDC ` +
+          `mcap=${compactNumber(priceUsdc, 2)} USDC pnl=${compactNumber(pnlUsdc, 2)} USDC`
+      );
+    }
     case "status":
       return console.log(
         `mode=${LIVE ? "LIVE" : "SIMULATION"} armed=${armed} spent=${spentSol.toFixed(4)}/${MAX_SESSION_SOL} SOL mint=${currentMint ?? "none"} watching=${feed ? config.mode : "no"}`

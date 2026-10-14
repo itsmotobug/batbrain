@@ -6,7 +6,7 @@ const CONFIG_PATH = path.join(__dirname, "strategy.json");
 const DEFAULTS = {
   mode: "dip",
   buySol: 0.005,
-  maxBuys: 3,
+  maxBuys: 0,
   cooldownSec: 10,
   windowSec: 60,
   minTicks: 5,
@@ -44,7 +44,10 @@ function normalize(cfg) {
   for (const [key, def] of Object.entries(DEFAULTS)) {
     if (typeof def === "number") {
       const v = Number(cfg[key]);
-      if (!Number.isFinite(v) || v <= 0) throw new Error(`${key} must be a positive number`);
+      const min = key === "maxBuys" ? 0 : Number.MIN_VALUE;
+      if (!Number.isFinite(v) || v < min) {
+        throw new Error(key === "maxBuys" ? "maxBuys must be 0 (unlimited) or a positive number" : `${key} must be a positive number`);
+      }
       cfg[key] = v;
     }
   }
@@ -66,12 +69,17 @@ class Strategy {
     this.lastBuyAt = null;
     this.lastBuyPrice = null;
     this.lastPrice = null;
+    this.lastRecord = null;
     this.startedAt = null;
+    this.positionQty = 0;
+    this.positionCostSol = 0;
+    this.averageCostSol = 0;
   }
 
-  record(now, price) {
+  record(now, price, marketRecord = null) {
     if (this.startedAt === null) this.startedAt = now;
     this.lastPrice = price;
+    this.lastRecord = marketRecord;
     this.history.push({ t: now, p: price });
     this.trim(now);
   }
@@ -82,7 +90,7 @@ class Strategy {
   }
 
   get done() {
-    return this.buys >= this.cfg.maxBuys;
+    return this.cfg.maxBuys > 0 && this.buys >= this.cfg.maxBuys;
   }
 
   // Returns { reason } when a buy should fire now, otherwise null.
@@ -132,17 +140,34 @@ class Strategy {
     return null;
   }
 
+  get positionSummary() {
+    return {
+      qty: this.positionQty,
+      avgCostSol: this.averageCostSol,
+      markPrice: this.lastPrice,
+      pnlSol: this.positionQty * (this.lastPrice - this.averageCostSol),
+    };
+  }
+
   // Call after an order was actually attempted so the strategy re-arms.
   markBought(now) {
     this.buys += 1;
     this.lastBuyAt = now;
     this.lastBuyPrice = this.lastPrice;
+
+    if (Number.isFinite(this.lastPrice) && this.lastPrice > 0) {
+      const estimatedQty = this.cfg.buySol / this.lastPrice;
+      this.positionQty += estimatedQty;
+      this.positionCostSol += this.cfg.buySol;
+      this.averageCostSol = this.positionCostSol / this.positionQty;
+    }
+
     // Start a fresh window so one move cannot trigger back-to-back buys.
     this.history = this.lastPrice === null ? [] : [{ t: now, p: this.lastPrice }];
   }
 }
 
-// Streams token trades from PumpPortal and reports each price (marketCapSol).
+// Streams token trades from PumpPortal and reports the live market-cap proxy (marketCapSol).
 class PriceFeed {
   constructor({ apiKey, mint, onPrice, onStatus }) {
     this.apiKey = apiKey;

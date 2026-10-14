@@ -1,4 +1,4 @@
-# Bat Brain
+# Bat Brain (Untested / Broken)
 
 <p align="center">
   <img src="./Cute%20Blue%20Mechanical%20Bat%20Drone.png" alt="Cute blue mechanical bat drone" width="240">
@@ -19,6 +19,8 @@ Double-click [start.bat](./start.bat). It asks whether to trade live, then opens
 
 **First-time setup:** copy [keys.example.bat](./keys.example.bat) to `keys.local.bat` and put your PumpPortal API key in it. `start.bat` loads that file. `keys.local.bat` is listed in `.gitignore`, so your key stays out of the repo; only the placeholder template is committed.
 
+If you want to check the linked wallet balance from the CLI, set `PUBLIC_WALLET_KEY` to the wallet's public key. Then run `balance` in the interactive bot to show the wallet's SOL and USDC values.
+
 ## Fast interactive mode
 
 Run `node script.js` with no arguments. The bot stays open with a persistent, pre-warmed HTTPS connection (kept alive every 20 s), so orders skip the TLS handshake. Each live order prints its round-trip time.
@@ -30,11 +32,14 @@ Run `node script.js` with no arguments. The bot stays open with a persistent, pr
 | `sell` | Sell 100% of the current mint |
 | `buy <MINT> [SOL]` / `sell <MINT>` | Same, and also sets the current mint |
 | `mint` | Show the current mint |
+| `balance` | Show the linked wallet's SOL and USDC balances |
+| `mcap` | Show the market cap in USD (PumpPortal market cap in SOL × live SOL/USD rate) |
+| `pnl` | Show average cost, quantity, and unrealized PnL based on the live price proxy |
 | `strategy` / `strategy modes` | Show strategy settings / list buying modes |
 | `strategy mode <name>` | Choose the buying mode |
 | `set <key> <value>` | Change a strategy setting (saved to `strategy.json`) |
 | `watch` / `unwatch` | Start / stop watching the current mint's price and buying per the strategy |
-| `price` | Show the latest price and buy count |
+| `price` | Show the latest market cap and buy count |
 | `arm` | Enable live orders for the session (type `TRADE` once) |
 | `disarm` | Disable live orders (also stops a running watch) |
 | `status` | Show mode, armed state, SOL spent, watch state |
@@ -44,7 +49,7 @@ In live mode nothing is sent until you run `arm`. After that, orders fire instan
 
 ## Strategy (automatic buying)
 
-`watch` streams the current mint's trades from PumpPortal and uses its market cap in SOL as the price. The strategy decides when to buy; the per-order and session caps still apply. In simulation mode it only prints the orders it would send. In live mode you must `arm` before `watch`.
+`watch` streams the current mint's trades from PumpPortal and uses its market cap in SOL as the strategy price proxy. The `mcap` and `price` commands show it in USD by multiplying by the SOL/USD rate, which is refreshed from CoinGecko every 30 seconds while watching (set `SOL_TO_USDC` to pin a fixed rate). The strategy decides when to buy; the per-order and session caps still apply. In simulation mode it only prints the orders it would send. In live mode you must `arm` before `watch`.
 
 The price feed needs the API key's wallet funded with at least 0.02 SOL.
 
@@ -58,7 +63,7 @@ Buying modes (built for a token already in an uptrend):
 | `ladder` | Immediately, then each time price falls `stepPct`% below the last buy |
 | `dca` | Every `intervalSec` seconds, regardless of price |
 
-Settings (defaults): `buySol` 0.005, `maxBuys` 3, `cooldownSec` 10, `windowSec` 60, `minTicks` 5 (trades needed before price modes act), `dropPct` 5, `abovePct` 1, `risePct` 3, `stepPct` 5, `intervalSec` 30. `buySol` cannot exceed 0.01. Watching stops after `maxBuys` buys, after 3 failed orders in a row, or if you change the current mint.
+Settings (defaults): `buySol` 0.005, `maxBuys` 0 (unlimited; set a number to cap buys per watch, e.g. for `ladder`), `cooldownSec` 10, `windowSec` 60, `minTicks` 5 (trades needed before price modes act), `dropPct` 5, `abovePct` 1, `risePct` 3, `stepPct` 5, `intervalSec` 30. `buySol` cannot exceed 0.01. Live spending is always limited by `MAX_SESSION_SOL`. Watching stops after `maxBuys` buys (if set), after 3 failed orders in a row, or if you change the current mint.
 
 Example:
 
